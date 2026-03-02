@@ -116,3 +116,31 @@ The rest of this repository is under the [MIT License](https://choosealicense.co
 ## Contact
 For queries and issues not fit for a github issue, please email [Achraf Ben Hamadou](mailto:achraf.benhamadou@crns.rnrt.tn) .
 
+
+## GUI locale pour segmenter des scans STL/OBJ
+
+Un script prêt à l'emploi est fourni : `gui_segmentation.py`.
+
+### Ce que fait ce GUI
+- Charge un fichier de scan `.stl` ou `.obj` (maxillaire ou mandibulaire).
+- Lance une segmentation **baseline géométrique** (clustering des vertices, sans modèle deep learning).
+- Exporte :
+  - un JSON au format challenge (`labels` + `instances`) ;
+  - un `.ply` coloré (optionnel) pour visualiser rapidement les régions segmentées.
+
+### Lancer l'interface graphique
+```bash
+python gui_segmentation.py
+```
+
+### Lancer en ligne de commande (sans GUI)
+```bash
+python gui_segmentation.py \
+  --input /chemin/scan_lower.stl \
+  --jaw lower \
+  --output-json /chemin/dental-labels.json \
+  --output-ply /chemin/segmented-preview.ply \
+  --n-teeth 14
+```
+
+> ⚠️ Cette implémentation est une **base de travail** pour utilisation locale. Pour des performances cliniques/benchmark, il faut remplacer la logique de segmentation par un modèle entraîné.
