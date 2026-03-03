@@ -20,6 +20,7 @@ try:
 
     matplotlib.use("TkAgg")
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.collections import PolyCollection
     from matplotlib.figure import Figure
 
     MATPLOTLIB_AVAILABLE = True
@@ -312,16 +313,19 @@ class SegmentationGUI:
         cmap = _instance_color_map(instances)
         face_colors = np.array([cmap[int(v)] for v in face_inst])
 
+        tri = xy[mesh.faces]  # (n_faces, 3, 2)
+
         fig = Figure(figsize=(8.8, 5.2), dpi=100)
         ax = fig.add_subplot(111)
-        ax.tripcolor(
-            xy[:, 0],
-            xy[:, 1],
-            triangles=mesh.faces,
+        poly = PolyCollection(
+            tri,
             facecolors=face_colors,
             edgecolors="none",
-            antialiased=True,
+            linewidths=0.0,
+            antialiaseds=False,
         )
+        ax.add_collection(poly)
+        ax.autoscale_view()
         ax.set_aspect("equal")
         ax.set_title("Prévisualisation surfacique (projection 2D de la mâchoire)")
         ax.axis("off")
