@@ -124,14 +124,14 @@ Un script prêt à l'emploi est fourni : `gui_segmentation.py`.
 ### Ce que fait ce GUI
 - Charge un fichier de scan `.stl` ou `.obj` (maxillaire ou mandibulaire).
 - Lance une segmentation **baseline géométrique** (clustering des vertices, sans modèle deep learning).
-- Affiche une **prévisualisation 2D** de la segmentation avant export.
+- Affiche une **prévisualisation surfacique** (pas un nuage de points) de la segmentation avant export.
 - Exporte :
   - un JSON au format challenge (`labels` + `instances`) ;
   - un `.ply` coloré (optionnel) pour visualiser rapidement les régions segmentées.
 
 ### Workflow recommandé dans la GUI
 1. Sélectionner le scan avec **Parcourir**.
-2. Cliquer sur **1) Prévisualiser** pour inspecter la segmentation.
+2. Cliquer sur **1) Prévisualiser** pour inspecter un rendu surfacique des dents détectées.
 3. Cliquer sur **2) Exporter** pour écrire les fichiers.
 4. Utiliser **Ouvrir dossier export** pour retrouver directement les sorties.
 

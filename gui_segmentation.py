@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""GUI locale pour segmenter et étiqueter des scans STL/OBJ de mâchoires.
-
-Ce script fournit :
-- un mode GUI (Tkinter) pour utilisateurs non techniques ;
-- un mode CLI pour automatisation/validation.
-
-La segmentation proposée est une baseline géométrique (non deep learning).
-"""
+"""GUI locale pour segmenter et étiqueter des scans STL/OBJ de mâchoires."""
 
 from __future__ import annotations
 
@@ -22,40 +15,19 @@ import trimesh
 if not hasattr(np, "product"):
     np.product = np.prod
 
+try:
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+
+    MATPLOTLIB_AVAILABLE = True
+except Exception:
+    MATPLOTLIB_AVAILABLE = False
+
 UPPER_FDI = [18, 17, 16, 15, 14, 13, 12, 11, 21, 22, 23, 24, 25, 26, 27, 28]
 LOWER_FDI = [48, 47, 46, 45, 44, 43, 42, 41, 31, 32, 33, 34, 35, 36, 37, 38]
-
-
-def _kmeans(points: np.ndarray, k: int, n_iter: int = 30, seed: int = 7) -> tuple[np.ndarray, np.ndarray]:
-    """K-means léger en NumPy (sans dépendance sklearn)."""
-    rng = np.random.default_rng(seed)
-    if k <= 1:
-        center = points.mean(axis=0, keepdims=True)
-        labels = np.zeros(points.shape[0], dtype=np.int32)
-        return labels, center
-
-    initial_idx = rng.choice(points.shape[0], size=min(k, points.shape[0]), replace=False)
-    centers = points[initial_idx]
-
-    if centers.shape[0] < k:
-        pad = np.repeat(centers[-1][None, :], k - centers.shape[0], axis=0)
-        centers = np.vstack([centers, pad])
-
-    labels = np.zeros(points.shape[0], dtype=np.int32)
-    for _ in range(n_iter):
-        distances = np.linalg.norm(points[:, None, :] - centers[None, :, :], axis=2)
-        new_labels = np.argmin(distances, axis=1)
-
-        if np.array_equal(new_labels, labels):
-            break
-
-        labels = new_labels
-        for c in range(k):
-            mask = labels == c
-            if mask.any():
-                centers[c] = points[mask].mean(axis=0)
-
-    return labels, centers
 
 
 def _label_order_for_jaw(jaw: str, n_teeth: int) -> list[int]:
@@ -67,47 +39,103 @@ def _label_order_for_jaw(jaw: str, n_teeth: int) -> list[int]:
     raise ValueError("La mâchoire doit être 'upper' ou 'lower'.")
 
 
-def segment_mesh_vertices(vertices: np.ndarray, jaw: str, n_teeth: int = 14) -> tuple[np.ndarray, np.ndarray]:
-    """Retourne labels FDI et instances pour chaque sommet du mesh."""
-    n_points = vertices.shape[0]
-    n_teeth = int(max(1, min(16, n_teeth)))
+def _pca_align(vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    center = vertices.mean(axis=0)
+    x = vertices - center
+    _, _, vt = np.linalg.svd(x, full_matrices=False)
+    aligned = x @ vt.T
+    return aligned, center, vt
 
-    xy = vertices[:, :2]
-    cluster_ids, centers = _kmeans(xy, n_teeth)
 
-    order = np.argsort(centers[:, 0])
-    fdi_list = _label_order_for_jaw(jaw, n_teeth)
+def _sector_segmentation(vertices: np.ndarray, jaw: str, n_teeth: int) -> tuple[np.ndarray, np.ndarray]:
+    aligned, _, _ = _pca_align(vertices)
+    xy = aligned[:, :2]
+    z = aligned[:, 2]
 
-    labels = np.zeros(n_points, dtype=np.int32)
-    instances = np.zeros(n_points, dtype=np.int32)
+    r = np.linalg.norm(xy, axis=1)
+    theta = np.arctan2(xy[:, 1], xy[:, 0])
 
-    distances = np.linalg.norm(xy - centers[cluster_ids], axis=1)
-    gingiva_threshold = np.quantile(distances, 0.70)
+    # On se concentre sur la couronne externe de l'arcade (moins de palais/langue).
+    outer_mask = r >= np.quantile(r, 0.35)
+    theta_outer = np.sort(theta[outer_mask])
+    if len(theta_outer) < n_teeth * 20:
+        theta_outer = np.sort(theta)
 
-    instance_id = 1
-    for ordered_pos, cluster_id in enumerate(order):
-        mask = cluster_ids == cluster_id
-        tooth_mask = mask & (distances <= gingiva_threshold)
+    # On couvre seulement l'arc occupé par la dentition observée.
+    t_min = np.quantile(theta_outer, 0.03)
+    t_max = np.quantile(theta_outer, 0.97)
+    bins = np.linspace(t_min, t_max, n_teeth + 1)
 
-        labels[tooth_mask] = fdi_list[ordered_pos]
-        instances[tooth_mask] = instance_id
-        instance_id += 1
+    sector = np.digitize(theta, bins[1:-1], right=False)
+    sector = np.clip(sector, 0, n_teeth - 1)
+
+    labels = np.zeros(len(vertices), dtype=np.int32)
+    instances = np.zeros(len(vertices), dtype=np.int32)
+    fdi = _label_order_for_jaw(jaw, n_teeth)
+
+    # Score "dent" plus robuste que distance simple au centre.
+    r_n = (r - r.min()) / max(1e-6, (r.max() - r.min()))
+
+    for i in range(n_teeth):
+        m = sector == i
+        if not m.any():
+            continue
+
+        z_loc = z[m]
+        z_med = np.median(z_loc)
+        z_abs = np.abs(z_loc - z_med)
+        z_n = (z_abs - z_abs.min()) / max(1e-6, (z_abs.max() - z_abs.min()))
+        score = 0.65 * r_n[m] + 0.35 * z_n
+
+        # Garde la partie la plus probable "dent" dans chaque secteur.
+        thr = np.quantile(score, 0.42)
+        tooth_local = score >= thr
+
+        tooth_mask = np.zeros(len(vertices), dtype=bool)
+        tooth_mask[m] = tooth_local
+
+        if tooth_mask.sum() < 200:
+            continue
+
+        labels[tooth_mask] = fdi[i]
+        instances[tooth_mask] = i + 1
 
     return labels, instances
 
 
-def _build_vertex_colors(instances: np.ndarray, labels: np.ndarray) -> np.ndarray:
-    colors = np.zeros((len(labels), 4), dtype=np.uint8)
-    colors[:, 3] = 255
-    colors[labels == 0, :3] = np.array([170, 170, 170], dtype=np.uint8)
+def segment_mesh_vertices(mesh: trimesh.Trimesh, jaw: str, n_teeth: int = 14) -> tuple[np.ndarray, np.ndarray]:
+    n_teeth = int(max(1, min(16, n_teeth)))
+    labels, instances = _sector_segmentation(mesh.vertices, jaw=jaw, n_teeth=n_teeth)
 
-    unique_instances = [i for i in np.unique(instances) if i != 0]
+    # Nettoyage simple: supprimer composantes minuscules par instance.
+    if len(mesh.faces) > 0:
+        for inst in np.unique(instances):
+            if inst == 0:
+                continue
+            vidx = np.where(instances == inst)[0]
+            if len(vidx) < 150:
+                labels[vidx] = 0
+                instances[vidx] = 0
+
+    return labels, instances
+
+
+def _instance_color_map(instances: np.ndarray) -> dict[int, np.ndarray]:
+    cmap = {0: np.array([0.70, 0.70, 0.70, 1.0])}
+    unique_instances = [int(i) for i in np.unique(instances) if i != 0]
     rng = np.random.default_rng(42)
-    palette = rng.integers(30, 255, size=(max(1, len(unique_instances)), 3), dtype=np.uint8)
-    for idx, inst in enumerate(unique_instances):
-        colors[instances == inst, :3] = palette[idx]
+    for i, inst in enumerate(unique_instances):
+        rgb = rng.random(3) * 0.75 + 0.2
+        cmap[inst] = np.array([rgb[0], rgb[1], rgb[2], 1.0])
+    return cmap
 
-    return colors
+
+def _build_vertex_colors(instances: np.ndarray) -> np.ndarray:
+    cmap = _instance_color_map(instances)
+    out = np.zeros((len(instances), 4), dtype=np.uint8)
+    for inst, rgba in cmap.items():
+        out[instances == inst] = (rgba * 255).astype(np.uint8)
+    return out
 
 
 def _compute_prediction(input_path: str, jaw: str, n_teeth: int = 14) -> tuple[trimesh.Trimesh, np.ndarray, np.ndarray, dict]:
@@ -115,7 +143,7 @@ def _compute_prediction(input_path: str, jaw: str, n_teeth: int = 14) -> tuple[t
     if not hasattr(mesh, "vertices"):
         raise ValueError("Le fichier chargé ne contient pas de vertices exploitables.")
 
-    labels, instances = segment_mesh_vertices(mesh.vertices, jaw=jaw, n_teeth=n_teeth)
+    labels, instances = segment_mesh_vertices(mesh, jaw=jaw, n_teeth=n_teeth)
     result = {
         "id_patient": os.path.splitext(os.path.basename(input_path))[0],
         "jaw": jaw,
@@ -131,7 +159,7 @@ def _save_outputs(mesh: trimesh.Trimesh, labels: np.ndarray, instances: np.ndarr
 
     if output_ply:
         colored = mesh.copy()
-        colored.visual.vertex_colors = _build_vertex_colors(instances, labels)
+        colored.visual.vertex_colors = _build_vertex_colors(instances)
         colored.export(output_ply)
 
 
@@ -145,7 +173,7 @@ class SegmentationGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("3DTeethSeg - GUI STL/OBJ")
-        self.root.geometry("860x640")
+        self.root.geometry("980x760")
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar(value="dental-labels.json")
@@ -159,6 +187,9 @@ class SegmentationGUI:
         self.current_instances: np.ndarray | None = None
         self.current_result: dict | None = None
 
+        self.preview_frame: ttk.Frame | None = None
+        self.preview_canvas = None
+
         self._build_layout()
 
     def _build_layout(self):
@@ -166,26 +197,26 @@ class SegmentationGUI:
         frm.pack(fill="both", expand=True)
 
         ttk.Label(frm, text="Scan STL/OBJ").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.input_var, width=80).grid(row=1, column=0, sticky="we", padx=(0, 8))
+        ttk.Entry(frm, textvariable=self.input_var, width=92).grid(row=1, column=0, sticky="we", padx=(0, 8))
         ttk.Button(frm, text="Parcourir", command=self._select_input).grid(row=1, column=1, sticky="e")
 
-        ttk.Label(frm, text="JSON de sortie").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(frm, textvariable=self.output_var, width=80).grid(row=3, column=0, sticky="we", padx=(0, 8))
+        ttk.Label(frm, text="JSON de sortie").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frm, textvariable=self.output_var, width=92).grid(row=3, column=0, sticky="we", padx=(0, 8))
         ttk.Button(frm, text="Choisir", command=self._select_output).grid(row=3, column=1, sticky="e")
 
-        ttk.Label(frm, text="Preview mesh coloré (PLY, optionnel)").grid(row=4, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(frm, textvariable=self.ply_var, width=80).grid(row=5, column=0, sticky="we", padx=(0, 8))
+        ttk.Label(frm, text="Preview mesh coloré (PLY, optionnel)").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frm, textvariable=self.ply_var, width=92).grid(row=5, column=0, sticky="we", padx=(0, 8))
         ttk.Button(frm, text="Choisir", command=self._select_ply).grid(row=5, column=1, sticky="e")
 
         options = ttk.Frame(frm)
-        options.grid(row=6, column=0, columnspan=2, sticky="we", pady=(14, 0))
+        options.grid(row=6, column=0, columnspan=2, sticky="we", pady=(10, 0))
         ttk.Label(options, text="Mâchoire").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(options, textvariable=self.jaw_var, values=["upper", "lower"], state="readonly", width=10).grid(row=0, column=1, sticky="w", padx=(8, 20))
+        ttk.Combobox(options, textvariable=self.jaw_var, values=["upper", "lower"], state="readonly", width=10).grid(row=0, column=1, sticky="w", padx=(8, 16))
         ttk.Label(options, text="Nb dents estimé").grid(row=0, column=2, sticky="w")
-        ttk.Spinbox(options, from_=1, to=16, textvariable=self.teeth_var, width=5).grid(row=0, column=3, sticky="w", padx=8)
+        ttk.Spinbox(options, from_=8, to=16, textvariable=self.teeth_var, width=5).grid(row=0, column=3, sticky="w", padx=8)
 
         action_bar = ttk.Frame(frm)
-        action_bar.grid(row=7, column=0, columnspan=2, sticky="we", pady=(16, 6))
+        action_bar.grid(row=7, column=0, columnspan=2, sticky="we", pady=(12, 6))
         ttk.Button(action_bar, text="1) Prévisualiser", command=self._preview).grid(row=0, column=0, sticky="we", padx=(0, 6))
         ttk.Button(action_bar, text="2) Exporter", command=self._export).grid(row=0, column=1, sticky="we", padx=(6, 6))
         ttk.Button(action_bar, text="Ouvrir dossier export", command=self._open_export_folder).grid(row=0, column=2, sticky="we", padx=(6, 0))
@@ -193,8 +224,8 @@ class SegmentationGUI:
         action_bar.columnconfigure(1, weight=1)
         action_bar.columnconfigure(2, weight=1)
 
-        self.canvas = tk.Canvas(frm, width=800, height=360, bg="white", highlightthickness=1, highlightbackground="#bfbfbf")
-        self.canvas.grid(row=8, column=0, columnspan=2, sticky="nsew", pady=(8, 6))
+        self.preview_frame = ttk.Frame(frm)
+        self.preview_frame.grid(row=8, column=0, columnspan=2, sticky="nsew", pady=(8, 6))
 
         ttk.Label(frm, textvariable=self.status_var, foreground="navy").grid(row=9, column=0, columnspan=2, sticky="w")
 
@@ -203,8 +234,14 @@ class SegmentationGUI:
         self._draw_placeholder()
 
     def _draw_placeholder(self):
-        self.canvas.delete("all")
-        self.canvas.create_text(400, 180, text="Cliquez sur '1) Prévisualiser' pour voir la segmentation avant export.", fill="#6b6b6b", font=("Arial", 12))
+        for child in self.preview_frame.winfo_children():
+            child.destroy()
+        lbl = ttk.Label(
+            self.preview_frame,
+            text="Cliquez sur '1) Prévisualiser' pour voir un rendu surfacique de la segmentation.",
+            anchor="center",
+        )
+        lbl.pack(fill="both", expand=True)
 
     def _select_input(self):
         p = filedialog.askopenfilename(filetypes=[("Meshes", "*.stl *.obj"), ("Tous", "*.*")])
@@ -249,63 +286,51 @@ class SegmentationGUI:
             self.current_labels = labels
             self.current_instances = instances
             self.current_result = result
-            self._draw_segmentation_preview(mesh.vertices, labels, instances)
-            self.status_var.set(
-                f"Prévisualisation OK : {len(labels)} sommets, {len(set(instances.tolist())) - (1 if 0 in instances else 0)} instances."
-            )
+            self._draw_segmentation_preview(mesh, instances)
+            n_inst = len([i for i in np.unique(instances) if i != 0])
+            self.status_var.set(f"Prévisualisation OK : {len(labels)} sommets, {n_inst} dents détectées.")
         except Exception as exc:
             self.status_var.set("Erreur pendant la prévisualisation.")
             messagebox.showerror("Erreur", str(exc))
 
-    def _draw_segmentation_preview(self, vertices: np.ndarray, labels: np.ndarray, instances: np.ndarray):
-        self.canvas.delete("all")
-        width = int(self.canvas.winfo_width() or 800)
-        height = int(self.canvas.winfo_height() or 360)
+    def _draw_segmentation_preview(self, mesh: trimesh.Trimesh, instances: np.ndarray):
+        for child in self.preview_frame.winfo_children():
+            child.destroy()
 
-        sample_size = min(6000, len(vertices))
-        idx = np.random.default_rng(0).choice(len(vertices), size=sample_size, replace=False)
-        sampled = vertices[idx]
-        sampled_labels = labels[idx]
-        sampled_instances = instances[idx]
+        if not MATPLOTLIB_AVAILABLE or len(mesh.faces) == 0:
+            ttk.Label(self.preview_frame, text="Matplotlib indisponible, prévisualisation surfacique non disponible.").pack(fill="both", expand=True)
+            return
 
-        x = sampled[:, 0]
-        y = sampled[:, 1]
-        x_span = max(1e-6, float(x.max() - x.min()))
-        y_span = max(1e-6, float(y.max() - y.min()))
+        aligned, _, _ = _pca_align(mesh.vertices)
+        xy = aligned[:, :2]
 
-        x_canvas = 20 + ((x - x.min()) / x_span) * (width - 40)
-        y_canvas = 20 + ((y - y.min()) / y_span) * (height - 40)
-        y_canvas = height - y_canvas
+        face_inst = np.zeros(len(mesh.faces), dtype=np.int32)
+        for i, f in enumerate(mesh.faces):
+            vals, counts = np.unique(instances[f], return_counts=True)
+            face_inst[i] = vals[np.argmax(counts)]
 
-        color_cache: dict[int, str] = {0: "#aaaaaa"}
-        rng = np.random.default_rng(42)
-        unique_inst = [int(v) for v in np.unique(sampled_instances) if v != 0]
-        for inst in unique_inst:
-            rgb = rng.integers(30, 255, size=3)
-            color_cache[inst] = f"#{int(rgb[0]):02x}{int(rgb[1]):02x}{int(rgb[2]):02x}"
+        cmap = _instance_color_map(instances)
+        face_colors = np.array([cmap[int(v)] for v in face_inst])
 
-        for px, py, inst in zip(x_canvas, y_canvas, sampled_instances):
-            c = color_cache.get(int(inst), "#aaaaaa")
-            self.canvas.create_oval(px, py, px + 1.6, py + 1.6, fill=c, outline=c)
-
-        gingiva_pct = float(np.mean(sampled_labels == 0) * 100.0)
-        self.canvas.create_rectangle(8, 8, 440, 46, fill="#ffffff", outline="#d0d0d0")
-        self.canvas.create_text(
-            16,
-            18,
-            anchor="w",
-            text=f"Prévisualisation 2D (projection XY) — {sample_size} points affichés",
-            fill="#202020",
-            font=("Arial", 10, "bold"),
+        fig = Figure(figsize=(8.8, 5.2), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.tripcolor(
+            xy[:, 0],
+            xy[:, 1],
+            triangles=mesh.faces,
+            facecolors=face_colors,
+            edgecolors="none",
+            antialiased=True,
         )
-        self.canvas.create_text(
-            16,
-            34,
-            anchor="w",
-            text=f"Instances visibles: {len(unique_inst)} | Gingiva approx: {gingiva_pct:.1f}%",
-            fill="#303030",
-            font=("Arial", 9),
-        )
+        ax.set_aspect("equal")
+        ax.set_title("Prévisualisation surfacique (projection 2D de la mâchoire)")
+        ax.axis("off")
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=self.preview_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.preview_canvas = canvas
 
     def _export(self):
         if self.current_result is None or self.current_mesh is None or self.current_labels is None or self.current_instances is None:
@@ -327,9 +352,7 @@ class SegmentationGUI:
                 output_json=output_json,
                 output_ply=output_ply,
             )
-            saved = [output_json]
-            if output_ply:
-                saved.append(output_ply)
+            saved = [output_json] + ([output_ply] if output_ply else [])
             self.status_var.set("Export terminé : " + " | ".join(saved))
             messagebox.showinfo("Export terminé", "Fichiers exportés :\n" + "\n".join(saved))
         except Exception as exc:
@@ -343,7 +366,6 @@ class SegmentationGUI:
             messagebox.showwarning("Dossier introuvable", "Le dossier d'export n'existe pas encore.")
             return
 
-        # Cross-platform best effort.
         try:
             if os.name == "nt":
                 os.startfile(base_dir)
@@ -361,7 +383,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jaw", choices=["upper", "lower"], help="Mâchoire: upper/lower")
     parser.add_argument("--output-json", default="dental-labels.json", help="Chemin du JSON de sortie")
     parser.add_argument("--output-ply", default="", help="Chemin du mesh PLY coloré (optionnel)")
-    parser.add_argument("--n-teeth", type=int, default=14, help="Nombre de dents à estimer (1-16)")
+    parser.add_argument("--n-teeth", type=int, default=14, help="Nombre de dents à estimer (8-16)")
     return parser.parse_args()
 
 
