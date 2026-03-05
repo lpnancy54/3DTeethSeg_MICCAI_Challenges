@@ -128,26 +128,29 @@ def segment_mesh_vertices(mesh: trimesh.Trimesh, jaw: str, n_teeth: int = 14) ->
     vertices = mesh.vertices
     aligned = _pca_align(vertices)
     xy = aligned[:, :2]
+    z = aligned[:, 2]
 
-    # 1) Score d'appartenance "dent" : couronne externe + relief local (courbure).
+    # 1) Score "dent" robuste (couronne externe + relief local + variation verticale).
     r = np.linalg.norm(xy, axis=1)
     r_n = (r - r.min()) / max(1e-8, (r.max() - r.min()))
+    z_n = (np.abs(z - np.median(z)) - np.min(np.abs(z - np.median(z))))
+    z_n = z_n / max(1e-8, z_n.max())
     c_n = _vertex_curvature_score(mesh)
-    tooth_score = 0.58 * r_n + 0.42 * c_n
+    tooth_score = 0.44 * r_n + 0.36 * c_n + 0.20 * z_n
 
-    candidate = tooth_score >= np.quantile(tooth_score, 0.66)
-    if candidate.sum() < n_teeth * 500:
-        candidate = tooth_score >= np.quantile(tooth_score, 0.60)
+    # seuil adaptatif (évite 0 dent en cas de scan lisse)
+    q = 0.68
+    candidate = tooth_score >= np.quantile(tooth_score, q)
+    while candidate.sum() < n_teeth * 120 and q > 0.40:
+        q -= 0.04
+        candidate = tooth_score >= np.quantile(tooth_score, q)
 
     cand_xy = xy[candidate]
-    cand_ids = np.where(candidate)[0]
     if len(cand_xy) < n_teeth * 80:
-        # Fallback minimal.
         cand_xy = xy
-        cand_ids = np.arange(len(xy))
 
-    # 2) Cluster des zones dents sur candidats.
-    c_labels, centers = _kmeans_numpy(cand_xy, n_teeth)
+    # 2) Cluster des zones dentaires.
+    _, centers = _kmeans_numpy(cand_xy, n_teeth)
 
     # 3) Mapping FDI par ordre gauche-droite PCA.
     order = np.argsort(centers[:, 0])
@@ -158,33 +161,56 @@ def segment_mesh_vertices(mesh: trimesh.Trimesh, jaw: str, n_teeth: int = 14) ->
     labels = np.zeros(len(vertices), dtype=np.int32)
     instances = np.zeros(len(vertices), dtype=np.int32)
 
-    # 4) Assigner les sommets proches des centres mais garder seulement partie "dent".
+    # 4) Assignation + filtrage doux pour éviter les fuites sur gingiva/palais.
     all_d = np.linalg.norm(xy[:, None, :] - centers[None, :, :], axis=2)
     nearest_cluster = np.argmin(all_d, axis=1)
 
+    min_size = max(120, int(0.00035 * len(vertices)))
     for c in range(n_teeth):
         m = nearest_cluster == c
         if not m.any():
             continue
 
-        # Dans chaque groupe, on garde les sommets les plus dentaires.
-        s = tooth_score[m]
-        thr = np.quantile(s, 0.52)
+        local_score = tooth_score[m]
+        # filtre principal
+        keep_score = local_score >= np.quantile(local_score, 0.40)
         mm = np.zeros(len(vertices), dtype=bool)
-        mm[m] = s >= thr
+        mm[m] = keep_score
 
-        # Limiter les fuites vers gingiva via distance au centre du cluster.
         dc = all_d[:, c]
-        dc_thr = np.quantile(dc[m], 0.88)
-        mm &= dc <= dc_thr
+        mm &= dc <= np.quantile(dc[m], 0.93)
 
-        # Garder la plus grande composante connexe.
+        # fallback cluster: si trop agressif, garder un noyau par distance + score
+        if mm.sum() < min_size:
+            core = np.zeros(len(vertices), dtype=bool)
+            dist_rank = dc[m] <= np.quantile(dc[m], 0.70)
+            score_rank = local_score >= np.quantile(local_score, 0.25)
+            core[m] = dist_rank & score_rank
+            mm = core
+
         mm = _largest_cc_mask(mesh, mm)
-        if mm.sum() < 220:
+        if mm.sum() < min_size:
+            # dernier fallback: attribuer tout le cluster proche du centre
+            mm = np.zeros(len(vertices), dtype=bool)
+            mm[m] = dc[m] <= np.quantile(dc[m], 0.60)
+            mm = _largest_cc_mask(mesh, mm)
+
+        if mm.sum() < min_size:
             continue
 
         instances[mm] = cluster_to_inst[c]
         labels[mm] = cluster_to_fdi[c]
+
+    # fallback global: garantir au moins une segmentation utile
+    if np.count_nonzero(instances) == 0:
+        inner = r <= np.quantile(r, 0.28)
+        for c in range(n_teeth):
+            m = nearest_cluster == c
+            mm = m & (~inner)
+            if mm.sum() < min_size:
+                continue
+            instances[mm] = cluster_to_inst[c]
+            labels[mm] = cluster_to_fdi[c]
 
     return labels, instances
 
