@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import tkinter as tk
+from collections import deque
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
@@ -40,83 +41,150 @@ def _label_order_for_jaw(jaw: str, n_teeth: int) -> list[int]:
     raise ValueError("La mâchoire doit être 'upper' ou 'lower'.")
 
 
-def _pca_align(vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _kmeans_numpy(points: np.ndarray, k: int, n_iter: int = 35, seed: int = 13) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    n = len(points)
+    if n == 0:
+        return np.zeros(0, dtype=np.int32), np.zeros((k, points.shape[1]), dtype=np.float32)
+
+    k = max(1, min(k, n))
+    centers = points[rng.choice(n, size=k, replace=False)].copy()
+    labels = np.zeros(n, dtype=np.int32)
+
+    for _ in range(n_iter):
+        d = np.linalg.norm(points[:, None, :] - centers[None, :, :], axis=2)
+        new_labels = np.argmin(d, axis=1)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for c in range(k):
+            m = labels == c
+            if m.any():
+                centers[c] = points[m].mean(axis=0)
+            else:
+                centers[c] = points[rng.integers(0, n)]
+
+    return labels, centers
+
+
+def _pca_align(vertices: np.ndarray) -> np.ndarray:
     center = vertices.mean(axis=0)
     x = vertices - center
     _, _, vt = np.linalg.svd(x, full_matrices=False)
     aligned = x @ vt.T
-    return aligned, center, vt
+    return aligned
 
 
-def _sector_segmentation(vertices: np.ndarray, jaw: str, n_teeth: int) -> tuple[np.ndarray, np.ndarray]:
-    aligned, _, _ = _pca_align(vertices)
-    xy = aligned[:, :2]
-    z = aligned[:, 2]
+def _vertex_curvature_score(mesh: trimesh.Trimesh) -> np.ndarray:
+    v = mesh.vertices
+    neighbors = mesh.vertex_neighbors
+    curv = np.zeros(len(v), dtype=np.float32)
 
-    r = np.linalg.norm(xy, axis=1)
-    theta = np.arctan2(xy[:, 1], xy[:, 0])
-
-    # On se concentre sur la couronne externe de l'arcade (moins de palais/langue).
-    outer_mask = r >= np.quantile(r, 0.35)
-    theta_outer = np.sort(theta[outer_mask])
-    if len(theta_outer) < n_teeth * 20:
-        theta_outer = np.sort(theta)
-
-    # On couvre seulement l'arc occupé par la dentition observée.
-    t_min = np.quantile(theta_outer, 0.03)
-    t_max = np.quantile(theta_outer, 0.97)
-    bins = np.linspace(t_min, t_max, n_teeth + 1)
-
-    sector = np.digitize(theta, bins[1:-1], right=False)
-    sector = np.clip(sector, 0, n_teeth - 1)
-
-    labels = np.zeros(len(vertices), dtype=np.int32)
-    instances = np.zeros(len(vertices), dtype=np.int32)
-    fdi = _label_order_for_jaw(jaw, n_teeth)
-
-    # Score "dent" plus robuste que distance simple au centre.
-    r_n = (r - r.min()) / max(1e-6, (r.max() - r.min()))
-
-    for i in range(n_teeth):
-        m = sector == i
-        if not m.any():
+    for i, nbs in enumerate(neighbors):
+        if len(nbs) == 0:
             continue
+        mean_nb = v[np.asarray(nbs)].mean(axis=0)
+        curv[i] = np.linalg.norm(v[i] - mean_nb)
 
-        z_loc = z[m]
-        z_med = np.median(z_loc)
-        z_abs = np.abs(z_loc - z_med)
-        z_n = (z_abs - z_abs.min()) / max(1e-6, (z_abs.max() - z_abs.min()))
-        score = 0.65 * r_n[m] + 0.35 * z_n
+    lo, hi = np.quantile(curv, [0.02, 0.98])
+    curv = np.clip(curv, lo, hi)
+    curv = (curv - curv.min()) / max(1e-8, (curv.max() - curv.min()))
+    return curv
 
-        # Garde la partie la plus probable "dent" dans chaque secteur.
-        thr = np.quantile(score, 0.42)
-        tooth_local = score >= thr
 
-        tooth_mask = np.zeros(len(vertices), dtype=bool)
-        tooth_mask[m] = tooth_local
+def _largest_cc_mask(mesh: trimesh.Trimesh, mask: np.ndarray) -> np.ndarray:
+    if not mask.any():
+        return mask
 
-        if tooth_mask.sum() < 200:
+    neighbors = mesh.vertex_neighbors
+    visited = np.zeros(len(mask), dtype=bool)
+    best_component = []
+
+    starts = np.where(mask)[0]
+    for s in starts:
+        if visited[s]:
             continue
+        q = deque([int(s)])
+        visited[s] = True
+        comp = [int(s)]
+        while q:
+            u = q.popleft()
+            for nb in neighbors[u]:
+                nb = int(nb)
+                if mask[nb] and not visited[nb]:
+                    visited[nb] = True
+                    q.append(nb)
+                    comp.append(nb)
+        if len(comp) > len(best_component):
+            best_component = comp
 
-        labels[tooth_mask] = fdi[i]
-        instances[tooth_mask] = i + 1
-
-    return labels, instances
+    out = np.zeros(len(mask), dtype=bool)
+    out[np.asarray(best_component, dtype=np.int32)] = True
+    return out
 
 
 def segment_mesh_vertices(mesh: trimesh.Trimesh, jaw: str, n_teeth: int = 14) -> tuple[np.ndarray, np.ndarray]:
-    n_teeth = int(max(1, min(16, n_teeth)))
-    labels, instances = _sector_segmentation(mesh.vertices, jaw=jaw, n_teeth=n_teeth)
+    n_teeth = int(max(8, min(16, n_teeth)))
+    vertices = mesh.vertices
+    aligned = _pca_align(vertices)
+    xy = aligned[:, :2]
 
-    # Nettoyage simple: supprimer composantes minuscules par instance.
-    if len(mesh.faces) > 0:
-        for inst in np.unique(instances):
-            if inst == 0:
-                continue
-            vidx = np.where(instances == inst)[0]
-            if len(vidx) < 150:
-                labels[vidx] = 0
-                instances[vidx] = 0
+    # 1) Score d'appartenance "dent" : couronne externe + relief local (courbure).
+    r = np.linalg.norm(xy, axis=1)
+    r_n = (r - r.min()) / max(1e-8, (r.max() - r.min()))
+    c_n = _vertex_curvature_score(mesh)
+    tooth_score = 0.58 * r_n + 0.42 * c_n
+
+    candidate = tooth_score >= np.quantile(tooth_score, 0.66)
+    if candidate.sum() < n_teeth * 500:
+        candidate = tooth_score >= np.quantile(tooth_score, 0.60)
+
+    cand_xy = xy[candidate]
+    cand_ids = np.where(candidate)[0]
+    if len(cand_xy) < n_teeth * 80:
+        # Fallback minimal.
+        cand_xy = xy
+        cand_ids = np.arange(len(xy))
+
+    # 2) Cluster des zones dents sur candidats.
+    c_labels, centers = _kmeans_numpy(cand_xy, n_teeth)
+
+    # 3) Mapping FDI par ordre gauche-droite PCA.
+    order = np.argsort(centers[:, 0])
+    fdi = _label_order_for_jaw(jaw, n_teeth)
+    cluster_to_inst = {int(c): i + 1 for i, c in enumerate(order)}
+    cluster_to_fdi = {int(c): int(fdi[i]) for i, c in enumerate(order)}
+
+    labels = np.zeros(len(vertices), dtype=np.int32)
+    instances = np.zeros(len(vertices), dtype=np.int32)
+
+    # 4) Assigner les sommets proches des centres mais garder seulement partie "dent".
+    all_d = np.linalg.norm(xy[:, None, :] - centers[None, :, :], axis=2)
+    nearest_cluster = np.argmin(all_d, axis=1)
+
+    for c in range(n_teeth):
+        m = nearest_cluster == c
+        if not m.any():
+            continue
+
+        # Dans chaque groupe, on garde les sommets les plus dentaires.
+        s = tooth_score[m]
+        thr = np.quantile(s, 0.52)
+        mm = np.zeros(len(vertices), dtype=bool)
+        mm[m] = s >= thr
+
+        # Limiter les fuites vers gingiva via distance au centre du cluster.
+        dc = all_d[:, c]
+        dc_thr = np.quantile(dc[m], 0.88)
+        mm &= dc <= dc_thr
+
+        # Garder la plus grande composante connexe.
+        mm = _largest_cc_mask(mesh, mm)
+        if mm.sum() < 220:
+            continue
+
+        instances[mm] = cluster_to_inst[c]
+        labels[mm] = cluster_to_fdi[c]
 
     return labels, instances
 
@@ -125,7 +193,7 @@ def _instance_color_map(instances: np.ndarray) -> dict[int, np.ndarray]:
     cmap = {0: np.array([0.70, 0.70, 0.70, 1.0])}
     unique_instances = [int(i) for i in np.unique(instances) if i != 0]
     rng = np.random.default_rng(42)
-    for i, inst in enumerate(unique_instances):
+    for inst in unique_instances:
         rgb = rng.random(3) * 0.75 + 0.2
         cmap[inst] = np.array([rgb[0], rgb[1], rgb[2], 1.0])
     return cmap
@@ -302,7 +370,7 @@ class SegmentationGUI:
             ttk.Label(self.preview_frame, text="Matplotlib indisponible, prévisualisation surfacique non disponible.").pack(fill="both", expand=True)
             return
 
-        aligned, _, _ = _pca_align(mesh.vertices)
+        aligned = _pca_align(mesh.vertices)
         xy = aligned[:, :2]
 
         face_inst = np.zeros(len(mesh.faces), dtype=np.int32)
@@ -313,17 +381,10 @@ class SegmentationGUI:
         cmap = _instance_color_map(instances)
         face_colors = np.array([cmap[int(v)] for v in face_inst])
 
-        tri = xy[mesh.faces]  # (n_faces, 3, 2)
-
+        tri = xy[mesh.faces]
         fig = Figure(figsize=(8.8, 5.2), dpi=100)
         ax = fig.add_subplot(111)
-        poly = PolyCollection(
-            tri,
-            facecolors=face_colors,
-            edgecolors="none",
-            linewidths=0.0,
-            antialiaseds=False,
-        )
+        poly = PolyCollection(tri, facecolors=face_colors, edgecolors="none", linewidths=0.0, antialiaseds=False)
         ax.add_collection(poly)
         ax.autoscale_view()
         ax.set_aspect("equal")
