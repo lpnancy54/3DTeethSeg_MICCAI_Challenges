@@ -124,93 +124,122 @@ def _largest_cc_mask(mesh: trimesh.Trimesh, mask: np.ndarray) -> np.ndarray:
 
 
 def segment_mesh_vertices(mesh: trimesh.Trimesh, jaw: str, n_teeth: int = 14) -> tuple[np.ndarray, np.ndarray]:
+    """Segmentation heuristique plus stable:
+    - détecte une bande dentaire externe (évite le palais/lingual)
+    - découpe l'arcade selon l'angle PCA
+    - extrait une composante connexe principale par dent
+    """
     n_teeth = int(max(8, min(16, n_teeth)))
     vertices = mesh.vertices
     aligned = _pca_align(vertices)
     xy = aligned[:, :2]
     z = aligned[:, 2]
 
-    # 1) Score "dent" robuste (couronne externe + relief local + variation verticale).
     r = np.linalg.norm(xy, axis=1)
+    theta = np.arctan2(xy[:, 1], xy[:, 0])
+
+    # Scores géométriques
     r_n = (r - r.min()) / max(1e-8, (r.max() - r.min()))
-    z_n = (np.abs(z - np.median(z)) - np.min(np.abs(z - np.median(z))))
-    z_n = z_n / max(1e-8, z_n.max())
+    z_dev = np.abs(z - np.median(z))
+    z_n = (z_dev - z_dev.min()) / max(1e-8, (z_dev.max() - z_dev.min()))
     c_n = _vertex_curvature_score(mesh)
-    tooth_score = 0.44 * r_n + 0.36 * c_n + 0.20 * z_n
+    tooth_score = 0.50 * r_n + 0.30 * c_n + 0.20 * z_n
 
-    # seuil adaptatif (évite 0 dent en cas de scan lisse)
-    q = 0.68
-    candidate = tooth_score >= np.quantile(tooth_score, q)
-    while candidate.sum() < n_teeth * 120 and q > 0.40:
+    # 1) Bande dentaire externe par secteur angulaire (adaptatif)
+    n_angle_bins = 180
+    bins = np.linspace(-np.pi, np.pi, n_angle_bins + 1)
+    angle_idx = np.clip(np.digitize(theta, bins) - 1, 0, n_angle_bins - 1)
+
+    radial_thr = np.zeros(n_angle_bins, dtype=np.float32)
+    for b in range(n_angle_bins):
+        m = angle_idx == b
+        if not m.any():
+            radial_thr[b] = np.quantile(r, 0.70)
+            continue
+        # on garde la partie extérieure du bin
+        radial_thr[b] = np.quantile(r[m], 0.62)
+
+    outer_band = r >= radial_thr[angle_idx]
+
+    # combine avec score dent adaptatif
+    q = 0.58
+    candidate = outer_band & (tooth_score >= np.quantile(tooth_score, q))
+    while candidate.sum() < n_teeth * 220 and q > 0.30:
         q -= 0.04
-        candidate = tooth_score >= np.quantile(tooth_score, q)
+        candidate = outer_band & (tooth_score >= np.quantile(tooth_score, q))
 
-    cand_xy = xy[candidate]
-    if len(cand_xy) < n_teeth * 80:
-        cand_xy = xy
+    # fallback: juste bande externe
+    if candidate.sum() < n_teeth * 100:
+        candidate = outer_band
 
-    # 2) Cluster des zones dentaires.
-    _, centers = _kmeans_numpy(cand_xy, n_teeth)
+    # 2) Arc dentaire utile (évite les zones hors arcade)
+    th_c = theta[candidate]
+    if len(th_c) < 200:
+        th_c = theta
+    t_min = np.quantile(th_c, 0.03)
+    t_max = np.quantile(th_c, 0.97)
+    if (t_max - t_min) < 0.8:
+        t_min = np.quantile(theta, 0.05)
+        t_max = np.quantile(theta, 0.95)
 
-    # 3) Mapping FDI par ordre gauche-droite PCA.
-    order = np.argsort(centers[:, 0])
-    fdi = _label_order_for_jaw(jaw, n_teeth)
-    cluster_to_inst = {int(c): i + 1 for i, c in enumerate(order)}
-    cluster_to_fdi = {int(c): int(fdi[i]) for i, c in enumerate(order)}
+    # 3) Découpe de l'arc en dents (ordre FDI)
+    tooth_bins = np.linspace(t_min, t_max, n_teeth + 1)
+    sector = np.clip(np.digitize(theta, tooth_bins) - 1, 0, n_teeth - 1)
 
     labels = np.zeros(len(vertices), dtype=np.int32)
     instances = np.zeros(len(vertices), dtype=np.int32)
 
-    # 4) Assignation + filtrage doux pour éviter les fuites sur gingiva/palais.
-    all_d = np.linalg.norm(xy[:, None, :] - centers[None, :, :], axis=2)
-    nearest_cluster = np.argmin(all_d, axis=1)
+    fdi = _label_order_for_jaw(jaw, n_teeth)
 
-    min_size = max(120, int(0.00035 * len(vertices)))
-    for c in range(n_teeth):
-        m = nearest_cluster == c
+    min_size = max(130, int(0.00035 * len(vertices)))
+
+    for i in range(n_teeth):
+        m = sector == i
         if not m.any():
             continue
 
+        local = np.zeros(len(vertices), dtype=bool)
+
+        # Zone dent: externe + score suffisant dans le secteur
         local_score = tooth_score[m]
-        # filtre principal
-        keep_score = local_score >= np.quantile(local_score, 0.40)
-        mm = np.zeros(len(vertices), dtype=bool)
-        mm[m] = keep_score
+        score_thr = np.quantile(local_score, 0.34)
+        local[m] = outer_band[m] & (local_score >= score_thr)
 
-        dc = all_d[:, c]
-        mm &= dc <= np.quantile(dc[m], 0.93)
+        # Limite en distance radiale interne (anti-palais)
+        r_loc = r[m]
+        r_cut = np.quantile(r_loc, 0.36)
+        radial_gate = np.zeros(len(vertices), dtype=bool)
+        radial_gate[m] = r[m] >= r_cut
+        local &= radial_gate
 
-        # fallback cluster: si trop agressif, garder un noyau par distance + score
-        if mm.sum() < min_size:
-            core = np.zeros(len(vertices), dtype=bool)
-            dist_rank = dc[m] <= np.quantile(dc[m], 0.70)
-            score_rank = local_score >= np.quantile(local_score, 0.25)
-            core[m] = dist_rank & score_rank
-            mm = core
+        local = _largest_cc_mask(mesh, local)
 
-        mm = _largest_cc_mask(mesh, mm)
-        if mm.sum() < min_size:
-            # dernier fallback: attribuer tout le cluster proche du centre
-            mm = np.zeros(len(vertices), dtype=bool)
-            mm[m] = dc[m] <= np.quantile(dc[m], 0.60)
-            mm = _largest_cc_mask(mesh, mm)
+        if local.sum() < min_size:
+            # fallback doux du secteur
+            local = np.zeros(len(vertices), dtype=bool)
+            local[m] = outer_band[m] & (r[m] >= np.quantile(r[m], 0.48))
+            local = _largest_cc_mask(mesh, local)
 
-        if mm.sum() < min_size:
+        if local.sum() < min_size:
             continue
 
-        instances[mm] = cluster_to_inst[c]
-        labels[mm] = cluster_to_fdi[c]
+        instances[local] = i + 1
+        labels[local] = fdi[i]
 
-    # fallback global: garantir au moins une segmentation utile
-    if np.count_nonzero(instances) == 0:
-        inner = r <= np.quantile(r, 0.28)
-        for c in range(n_teeth):
-            m = nearest_cluster == c
-            mm = m & (~inner)
-            if mm.sum() < min_size:
+    # fallback global: si trop peu de dents, assigne secteur externe
+    detected = len([x for x in np.unique(instances) if x != 0])
+    if detected < max(6, n_teeth // 2):
+        labels[:] = 0
+        instances[:] = 0
+        for i in range(n_teeth):
+            m = sector == i
+            local = np.zeros(len(vertices), dtype=bool)
+            local[m] = outer_band[m] & (tooth_score[m] >= np.quantile(tooth_score[m], 0.22))
+            local = _largest_cc_mask(mesh, local)
+            if local.sum() < min_size:
                 continue
-            instances[mm] = cluster_to_inst[c]
-            labels[mm] = cluster_to_fdi[c]
+            instances[local] = i + 1
+            labels[local] = fdi[i]
 
     return labels, instances
 
